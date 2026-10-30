@@ -1,4 +1,4 @@
-# Movie Review AI
+# CritiQ — Movie Review AI
 
 A Flask web app that predicts whether a movie review sounds positive or negative. The backend loads `sentiment_model.keras`, converts raw text into the same IMDB word-index format used during training, and returns the prediction to a glassmorphism browser UI.
 
@@ -24,7 +24,7 @@ A Flask web app that predicts whether a movie review sounds positive or negative
 ## Project Structure
 
 ```text
-movie_review_ai/
+CritiQ/
   app.py
   model.py
   requirements.txt

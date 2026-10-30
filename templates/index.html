@@ -3,18 +3,18 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Movie Review AI</title>
+    <title>CritiQ — Movie Review AI</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="../static/styles.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
   </head>
   <body>
     <main class="shell">
       <section class="hero" aria-labelledby="page-title">
         <div class="hero-copy">
           <p class="eyebrow">Sentiment analysis</p>
-          <h1 id="page-title">Movie Review AI</h1>
+          <h1 id="page-title">CritiQ</h1>
           <p class="lede">
             Paste a review and get an instant sentiment prediction from a TensorFlow model trained on IMDB reviews.
           </p>
@@ -61,6 +61,6 @@
       </section>
     </main>
 
-    <script src="../static/app.js"></script>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
   </body>
 </html>

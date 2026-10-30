@@ -1,0 +1,22 @@
+# Project improvement plan
+plan.md
+.superpowers/
+
+# Python bytecode & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.pytest_cache/
+.ruff_cache/
+
+# Browser & temp artifacts
+.chrome-temp/
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
