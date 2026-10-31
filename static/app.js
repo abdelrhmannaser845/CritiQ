@@ -3,33 +3,358 @@ const textarea = document.querySelector("#reviewText");
 const submitButton = document.querySelector("#submitButton");
 const clearButton = document.querySelector("#clearButton");
 const message = document.querySelector("#message");
-const resultLabel = document.querySelector("#resultLabel");
-const resultDetail = document.querySelector("#resultDetail");
-const meterFill = document.querySelector("#meterFill");
+
 const scorePanel = document.querySelector(".score-panel");
+const resultLabel = document.querySelector("#resultLabel");
+const resultPercent = document.querySelector("#resultPercent");
+const verdictBadge = document.querySelector("#verdictBadge");
+const resultDetail = document.querySelector("#resultDetail");
+const resultMeta = document.querySelector("#resultMeta");
+const meterFill = document.querySelector("#meterFill");
+
 const charCount = document.querySelector("#charCount");
+const driverChips = document.querySelector("#driverChips");
+
+const teleLabel = document.querySelector("#teleLabel");
+const teleConfidence = document.querySelector("#teleConfidence");
+const teleScore = document.querySelector("#teleScore");
+const telePadding = document.querySelector("#telePadding");
+
+const themeToggle = document.querySelector("#themeToggle");
+const themeLabel = document.querySelector("#themeLabel");
+const brandMarkImg = document.querySelector("#brandMarkImg");
+const footerCopy = document.querySelector("#footerCopy");
+
+const sampleCards = document.querySelectorAll(".sample-card");
 const glassPanels = document.querySelectorAll(".score-panel, .analyzer, .examples");
+
 const API_BASE = window.location.protocol === "file:" ? "http://127.0.0.1:5000" : "";
+const MAX_REVIEW_CHARS = 5000;
+const MIN_REVIEW_WORDS = 3;
+let browserModelPromise = null;
+
+async function loadBrowserModel() {
+  if (!browserModelPromise) {
+    const candidates = [
+      "static/model_bundle.json",
+      "/static/model_bundle.json",
+      "../../static/model_bundle.json",
+    ];
+    browserModelPromise = (async () => {
+      for (const url of candidates) {
+        try {
+          const res = await fetch(url);
+          if (res.ok) {
+            return await res.json();
+          }
+        } catch (_err) {
+          // try next relative path candidate
+        }
+      }
+      throw new Error("Could not load static/model_bundle.json");
+    })();
+  }
+  return browserModelPromise;
+}
+
+async function classifyReviewInBrowser(rawText) {
+  const t0 = performance.now();
+  const bundle = await loadBrowserModel();
+  const words = rawText.toLowerCase().match(/[a-zA-Z']+/g) || [];
+  const seq = [];
+  let tokensMapped = 0;
+
+  for (const w of words) {
+    const idx = bundle.vocab[w];
+    if (idx !== undefined && idx < bundle.num_words) {
+      seq.push(idx);
+      tokensMapped += 1;
+    } else {
+      seq.push(2);
+    }
+  }
+
+  // Pad or truncate (pre-padding / pre-truncating to max_len = 200 like tf.keras.preprocessing.sequence.pad_sequences)
+  const maxLen = bundle.max_len || 200;
+  const padded = new Array(maxLen).fill(0);
+  const slice = seq.slice(-maxLen);
+  const offset = maxLen - slice.length;
+  for (let i = 0; i < slice.length; i++) {
+    padded[offset + i] = slice[i];
+  }
+
+  // Layer 0 + 1: Embedding(10000, 16) -> GlobalAveragePooling1D()
+  const embDim = bundle.embedding[0].length;
+  const pooled = new Array(embDim).fill(0);
+  for (let t = 0; t < maxLen; t++) {
+    const row = bundle.embedding[padded[t]];
+    for (let d = 0; d < embDim; d++) {
+      pooled[d] += row[d];
+    }
+  }
+  for (let d = 0; d < embDim; d++) {
+    pooled[d] /= maxLen;
+  }
+
+  // Layer 2: Dense(16, activation="relu")
+  const hiddenDim = bundle.dense1_b.length;
+  const hidden = new Array(hiddenDim).fill(0);
+  for (let j = 0; j < hiddenDim; j++) {
+    let sum = bundle.dense1_b[j];
+    for (let d = 0; d < embDim; d++) {
+      sum += pooled[d] * bundle.dense1_w[d][j];
+    }
+    hidden[j] = sum > 0 ? sum : 0;
+  }
+
+  // Layer 3: Dense(1, activation="sigmoid")
+  let logit = bundle.dense2_b;
+  for (let j = 0; j < hiddenDim; j++) {
+    logit += hidden[j] * bundle.dense2_w[j];
+  }
+  const score = 1 / (1 + Math.exp(-logit));
+  const label = score >= 0.5 ? "Positive" : "Negative";
+  const confidence = label === "Positive" ? score : 1 - score;
+  const latencyMs = Math.round((performance.now() - t0) * 10) / 10;
+
+  return {
+    label,
+    score: Number(score.toFixed(4)),
+    confidence: Number(confidence.toFixed(4)),
+    percent: Number((score * 100).toFixed(1)),
+    word_count: words.length,
+    tokens_mapped: tokensMapped,
+    latency_ms: latencyMs,
+    drivers: extractFallbackDrivers(rawText, label === "Positive"),
+  };
+}
+
+const POSITIVE_VOCAB = new Set([
+  "excellent", "confident", "moving", "brilliant", "fantastic", "wonderful",
+  "warm", "sharp", "gorgeous", "strong", "masterpiece", "great", "love",
+  "best", "superb", "emotional", "earned", "earns", "stays", "beautiful",
+  "compelling", "engaging", "remarkable", "stunning", "triumph", "promising",
+  "talented", "masterful", "sublime", "vivid", "captivating", "terrific",
+  "impressive", "powerful", "good", "fine", "rich", "solid", "fun", "fresh"
+]);
+
+const NEGATIVE_VOCAB = new Set([
+  "dull", "missed", "unfinished", "lifeless", "boring", "terrible", "worst",
+  "awful", "weak", "flat", "waste", "poor", "bad", "loses", "mess", "slow",
+  "disappointing", "predictable", "pointless", "flawed", "tedious", "unresolved",
+  "clunky", "shallow", "tired", "cheap", "forgettable", "hollow", "wooden",
+  "stale", "failed", "drags", "messy", "lacks", "ruined"
+]);
+
+function countWords(text) {
+  if (!text) return 0;
+  const matches = text.match(/[a-zA-Z']+/g);
+  return matches ? matches.length : 0;
+}
+
+function escapeHtml(str) {
+  if (!str) return "";
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
 
 function updateCharacterCount() {
   const length = textarea.value.length;
-  charCount.textContent = `${length.toLocaleString()} ${length === 1 ? "character" : "characters"}`;
+  const words = countWords(textarea.value);
+  charCount.textContent = `${length.toLocaleString()} CHARACTERS // ${words} WORDS`;
 }
 
-function setResult(result) {
-  scorePanel.classList.remove("is-loading", "is-positive", "is-negative");
-  scorePanel.classList.add(result.label === "Positive" ? "is-positive" : "is-negative");
-  resultLabel.textContent = result.label;
-  resultDetail.textContent = `${Math.round(result.confidence * 100)}% confidence, ${result.percent}% positive score`;
+function extractFallbackDrivers(text, isPositive) {
+  if (!text) return [];
+
+  const rawWords = text.toLowerCase().match(/[a-zA-Z']+/g) || [];
+  const seen = new Set();
+  const uniqueWords = [];
+
+  for (const w of rawWords) {
+    const clean = w.replace(/^'+|'+$/g, "");
+    if (clean.length >= 2 && !seen.has(clean)) {
+      seen.add(clean);
+      uniqueWords.push(clean);
+    }
+  }
+
+  const primaryVocab = isPositive ? POSITIVE_VOCAB : NEGATIVE_VOCAB;
+  const secondaryVocab = isPositive ? NEGATIVE_VOCAB : POSITIVE_VOCAB;
+  const primaryPolarity = isPositive ? "positive" : "negative";
+  const secondaryPolarity = isPositive ? "negative" : "positive";
+
+  const drivers = [];
+  const picked = new Set();
+
+  // 1. Primary vocabulary matches
+  for (const w of uniqueWords) {
+    if (primaryVocab.has(w) && !picked.has(w)) {
+      picked.add(w);
+      drivers.push({ word: w, polarity: primaryPolarity });
+      if (drivers.length >= 4) return drivers;
+    }
+  }
+
+  // 2. Secondary vocabulary matches
+  for (const w of uniqueWords) {
+    if (secondaryVocab.has(w) && !picked.has(w)) {
+      picked.add(w);
+      drivers.push({ word: w, polarity: secondaryPolarity });
+      if (drivers.length >= 4) return drivers;
+    }
+  }
+
+  // 3. Fallback: longest words >= 5 characters from review
+  const longWords = uniqueWords
+    .filter((w) => w.length >= 5 && !picked.has(w))
+    .sort((a, b) => b.length - a.length);
+
+  for (const w of longWords) {
+    picked.add(w);
+    drivers.push({ word: w, polarity: primaryPolarity });
+    if (drivers.length >= 4) return drivers;
+  }
+
+  // 4. Any remaining words >= 3 chars
+  for (const w of uniqueWords) {
+    if (w.length >= 3 && !picked.has(w)) {
+      picked.add(w);
+      drivers.push({ word: w, polarity: primaryPolarity });
+      if (drivers.length >= 4) return drivers;
+    }
+  }
+
+  return drivers;
+}
+
+function renderDrivers(drivers, text, isPositive) {
+  let list = drivers;
+  if (!Array.isArray(list) || list.length === 0) {
+    list = extractFallbackDrivers(text, isPositive);
+  }
+
+  if (!list || list.length === 0) {
+    driverChips.innerHTML = '<span class="driver-chip is-muted">awaiting review input</span>';
+    return;
+  }
+
+  const html = list.slice(0, 4).map((d) => {
+    const polarity = d.polarity === "positive" ? "positive" : "negative";
+    const sign = polarity === "positive" ? "+" : "-";
+    return `<span class="driver-chip is-${polarity}">${sign} ${escapeHtml(d.word)}</span>`;
+  }).join("");
+
+  driverChips.innerHTML = html;
+}
+
+function setResult(result, elapsedMs) {
+  scorePanel.classList.remove("is-loading", "is-positive", "is-negative", "is-mixed");
+
+  const rawLabel = result.label || (result.score >= 0.5 ? "Positive" : "Negative");
+  const isPositive = rawLabel.toLowerCase() === "positive";
+  const isNegative = rawLabel.toLowerCase() === "negative";
+  const isMixed = rawLabel.toLowerCase() === "mixed";
+
+  if (isMixed) {
+    scorePanel.classList.add("is-mixed");
+    verdictBadge.textContent = "MIXED SIGNAL";
+  } else if (isPositive) {
+    scorePanel.classList.add("is-positive");
+    verdictBadge.textContent = "POSITIVE SIGNAL";
+  } else {
+    scorePanel.classList.add("is-negative");
+    verdictBadge.textContent = "NEGATIVE SIGNAL";
+  }
+
+  resultLabel.textContent = rawLabel;
+  resultPercent.textContent = `${result.percent}%`;
   meterFill.style.width = `${result.percent}%`;
+
+  const confNum = typeof result.confidence === "number" ? result.confidence : parseFloat(result.confidence || 0);
+  const confPct = Math.round(confNum * 100);
+  const words = result.word_count !== undefined ? result.word_count : countWords(textarea.value);
+
+  if (isMixed) {
+    resultDetail.textContent = `${confPct}% confidence — balanced critical signal across ${words} words (${result.percent}% positive score).`;
+  } else if (isPositive) {
+    resultDetail.textContent = `${confPct}% confidence — strong positive pulse across ${words} words (${result.percent}% positive score).`;
+  } else {
+    resultDetail.textContent = `${confPct}% confidence — sharp negative verdict across ${words} words (${result.percent}% positive score).`;
+  }
+
+  const scoreNum = typeof result.score === "number" ? result.score : parseFloat(result.score || 0);
+  const latencyMs = result.latency_ms !== undefined ? result.latency_ms : (elapsedMs !== undefined ? Math.round(elapsedMs) : 0);
+  resultMeta.textContent = `SCORE: ${scoreNum.toFixed(4)} // THRESHOLD: >= 0.50 // LATENCY: ${latencyMs}ms`;
+
+  teleLabel.textContent = rawLabel;
+  teleConfidence.textContent = `${confNum.toFixed(4)} (${confPct}%)`;
+  teleScore.textContent = scoreNum.toFixed(4);
+
+  if (result.tokens_mapped !== undefined) {
+    telePadding.textContent = `200 TOKENS (${result.tokens_mapped} MAPPED)`;
+  } else {
+    telePadding.textContent = "200 TOKENS (IMDB_WORD_INDEX)";
+  }
+
+  message.className = "message is-ok";
+  message.textContent = `STATUS: 200 OK — ${isMixed ? "Mixed" : (isPositive ? "Positive" : "Negative")} sentiment classification complete.`;
+
+  renderDrivers(result.drivers, textarea.value, isPositive);
 }
 
 function resetResult() {
-  message.textContent = "";
-  scorePanel.classList.remove("is-loading", "is-positive", "is-negative");
+  scorePanel.classList.remove("is-loading", "is-positive", "is-negative", "is-mixed");
   resultLabel.textContent = "Waiting";
-  resultDetail.textContent = "Submit a review to analyze it.";
+  resultPercent.textContent = "0.0%";
+  verdictBadge.textContent = "WAITING";
+  resultDetail.textContent = "Submit a review to measure its critical weight.";
+  resultMeta.textContent = "SCORE: — // THRESHOLD: >= 0.50 // LATENCY: —";
   meterFill.style.width = "0%";
+  driverChips.innerHTML = '<span class="driver-chip is-muted">awaiting review input</span>';
+
+  teleLabel.textContent = "Waiting";
+  teleConfidence.textContent = "—";
+  teleScore.textContent = "—";
+  telePadding.textContent = "200 TOKENS (IMDB_WORD_INDEX)";
+
+  message.textContent = "";
+  message.className = "message";
+
+  sampleCards.forEach((card) => card.classList.remove("is-active"));
+}
+
+function toggleTheme() {
+  const current = document.documentElement.dataset.theme || "dark";
+  const next = current === "dark" ? "light" : "dark";
+  document.documentElement.dataset.theme = next;
+
+  const isDark = next === "dark";
+
+  if (themeLabel) {
+    themeLabel.textContent = isDark ? "PAPER LIGHT" : "SCREENING DARK";
+  }
+
+  if (brandMarkImg) {
+    const src = isDark ? brandMarkImg.dataset.darkSrc : brandMarkImg.dataset.lightSrc;
+    if (src) {
+      brandMarkImg.src = src;
+    }
+  }
+
+  if (footerCopy) {
+    footerCopy.textContent = isDark
+      ? "CRITIQ VISUAL IDENTITY // 60% SCREENING INK (#09111E) • 30% LENS CYAN/TEAL (#38BDF8) • 10% VERDICT CORAL (#F04E2A)"
+      : "CRITIQ EDITORIAL LIGHT // 60% CELLULOID PAPER (#F6F2EA) • 30% DICHROIC TEAL (#0D6E82) • 10% VERDICT CORAL (#F04E2A)";
+  }
+}
+
+if (themeToggle) {
+  themeToggle.addEventListener("click", toggleTheme);
 }
 
 glassPanels.forEach((panel) => {
@@ -48,38 +373,116 @@ glassPanels.forEach((panel) => {
   });
 });
 
-textarea.addEventListener("input", updateCharacterCount);
+textarea.addEventListener("input", () => {
+  updateCharacterCount();
+  sampleCards.forEach((card) => card.classList.remove("is-active"));
+});
+
+textarea.addEventListener("keydown", (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+    event.preventDefault();
+    if (!submitButton.disabled) {
+      if (typeof form.requestSubmit === "function") {
+        form.requestSubmit();
+      } else {
+        submitButton.click();
+      }
+    }
+  }
+});
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
   message.textContent = "";
+  message.className = "message";
+  scorePanel.classList.remove("is-positive", "is-negative", "is-mixed");
   scorePanel.classList.add("is-loading");
   submitButton.disabled = true;
   submitButton.textContent = "Analyzing...";
 
+  const startTime = performance.now();
+  const rawReview = textarea.value.trim();
+  let response;
+  let payload;
+  let useBrowserFallback = false;
+
   try {
-    const response = await fetch(`${API_BASE}/predict`, {
+    response = await fetch(`${API_BASE}/predict`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ review: textarea.value }),
     });
-
-    const payload = await response.json();
-
-    if (!response.ok) {
-      throw new Error(payload.error || "Could not analyze this review.");
+    if (response.status === 404 || response.status === 405) {
+      // Static hosting (e.g., GitHub Pages) returns 404/405 on POST /predict
+      useBrowserFallback = true;
     }
-
-    setResult(payload);
-  } catch (error) {
-    scorePanel.classList.remove("is-loading");
-    message.textContent = "Could not reach Flask. Run python app.py and open http://127.0.0.1:5000.";
-  } finally {
-    submitButton.disabled = false;
-    submitButton.textContent = "Analyze Review";
+  } catch (_networkError) {
+    useBrowserFallback = true;
   }
+
+  if (useBrowserFallback) {
+    if (!rawReview) {
+      scorePanel.classList.remove("is-loading");
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      message.className = "message is-error";
+      message.textContent = "Please enter a movie review.";
+      return;
+    }
+    if (rawReview.length > MAX_REVIEW_CHARS) {
+      scorePanel.classList.remove("is-loading");
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      message.className = "message is-error";
+      message.textContent = `Review must not exceed ${MAX_REVIEW_CHARS} characters.`;
+      return;
+    }
+    if (countWords(rawReview) < MIN_REVIEW_WORDS) {
+      scorePanel.classList.remove("is-loading");
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      message.className = "message is-error";
+      message.textContent = `Please enter at least ${MIN_REVIEW_WORDS} words.`;
+      return;
+    }
+    try {
+      const localResult = await classifyReviewInBrowser(rawReview);
+      scorePanel.classList.remove("is-loading");
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      setResult(localResult, performance.now() - startTime);
+      return;
+    } catch (_fallbackErr) {
+      scorePanel.classList.remove("is-loading");
+      message.className = "message is-error";
+      message.textContent = "Could not reach Flask. Run python app.py and open http://127.0.0.1:5000.";
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      return;
+    }
+  }
+
+  const elapsedMs = performance.now() - startTime;
+
+  try {
+    payload = await response.json();
+  } catch (parseError) {
+    payload = { error: `HTTP ${response.status}: Failed to parse server response.` };
+  }
+
+  scorePanel.classList.remove("is-loading");
+  submitButton.disabled = false;
+  submitButton.textContent = "Analyze Review";
+
+  if (!response.ok) {
+    message.className = "message is-error";
+    message.textContent = (payload && payload.error) || "Could not analyze this review.";
+    return;
+  }
+
+  setResult(payload, elapsedMs);
 });
 
 clearButton.addEventListener("click", () => {
@@ -89,10 +492,13 @@ clearButton.addEventListener("click", () => {
   textarea.focus();
 });
 
-document.querySelectorAll("[data-review]").forEach((button) => {
+sampleCards.forEach((button) => {
   button.addEventListener("click", () => {
-    textarea.value = button.dataset.review;
+    sampleCards.forEach((card) => card.classList.remove("is-active"));
+    button.classList.add("is-active");
+    textarea.value = button.dataset.review || "";
     resetResult();
+    button.classList.add("is-active");
     updateCharacterCount();
     textarea.focus();
   });
