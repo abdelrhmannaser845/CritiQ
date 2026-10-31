@@ -146,3 +146,77 @@ def test_cors_headers_present_on_responses(client):
             response = client.post(item[1], json=item[2])
 
         assert response.headers.get("Access-Control-Allow-Origin") == "*"
+
+
+def test_home_page_includes_figcraft_ui_elements(client):
+    """GET / includes key FigCraft UI hooks and brand elements."""
+    response = client.get("/")
+    assert response.status_code == 200
+
+    html = response.get_data(as_text=True)
+    expected_hooks = [
+        'id="themeToggle"',
+        'id="verdictBadge"',
+        'id="sentimentDrivers"',
+        'id="driverChips"',
+        'id="teleLabel"',
+        'id="teleConfidence"',
+        'id="teleScore"',
+        "critiq-app-icon.svg",
+        "critiq-mark-on-dark.svg",
+        "Read between the frames.",
+    ]
+    for hook in expected_hooks:
+        assert hook in html, f"Expected '{hook}' in home page HTML"
+
+
+def test_static_brand_assets_served(client):
+    """Verify all static brand assets are served with 200 OK."""
+    assets = [
+        "/static/critiq-app-icon.svg",
+        "/static/critiq-mark-on-dark.svg",
+        "/static/critiq-mark.svg",
+        "/static/critiq.ico",
+    ]
+    for asset in assets:
+        response = client.get(asset)
+        assert response.status_code == 200, f"Failed to serve static asset {asset}"
+        assert len(response.data) > 0
+
+
+def test_predict_returns_ui_telemetry_fields(client):
+    """POST /predict returns word_count, tokens_mapped, latency_ms, and drivers list."""
+    response = client.post(
+        "/predict",
+        json={"review": "A truly wonderful and moving film with excellent acting."},
+    )
+    assert response.status_code == 200
+
+    payload = response.get_json()
+    for field in (
+        "label",
+        "score",
+        "confidence",
+        "percent",
+        "word_count",
+        "tokens_mapped",
+        "latency_ms",
+        "drivers",
+    ):
+        assert field in payload, f"Expected '{field}' in /predict response"
+
+    assert isinstance(payload["word_count"], int)
+    assert payload["word_count"] >= 3
+    assert isinstance(payload["tokens_mapped"], int)
+    assert 0 <= payload["tokens_mapped"] <= payload["word_count"]
+    assert isinstance(payload["latency_ms"], (int, float))
+    assert payload["latency_ms"] >= 0.0
+
+    assert isinstance(payload["drivers"], list)
+    assert len(payload["drivers"]) <= 4
+    for driver in payload["drivers"]:
+        assert isinstance(driver, dict)
+        assert "word" in driver
+        assert "polarity" in driver
+        assert driver["polarity"] in ("positive", "negative")
+
