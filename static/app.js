@@ -29,6 +29,105 @@ const sampleCards = document.querySelectorAll(".sample-card");
 const glassPanels = document.querySelectorAll(".score-panel, .analyzer, .examples");
 
 const API_BASE = window.location.protocol === "file:" ? "http://127.0.0.1:5000" : "";
+const MAX_REVIEW_CHARS = 5000;
+const MIN_REVIEW_WORDS = 3;
+let browserModelPromise = null;
+
+async function loadBrowserModel() {
+  if (!browserModelPromise) {
+    const candidates = [
+      "static/model_bundle.json",
+      "/static/model_bundle.json",
+      "../../static/model_bundle.json",
+    ];
+    browserModelPromise = (async () => {
+      for (const url of candidates) {
+        try {
+          const res = await fetch(url);
+          if (res.ok) {
+            return await res.json();
+          }
+        } catch (_err) {
+          // try next relative path candidate
+        }
+      }
+      throw new Error("Could not load static/model_bundle.json");
+    })();
+  }
+  return browserModelPromise;
+}
+
+async function classifyReviewInBrowser(rawText) {
+  const t0 = performance.now();
+  const bundle = await loadBrowserModel();
+  const words = rawText.toLowerCase().match(/[a-zA-Z']+/g) || [];
+  const seq = [];
+  let tokensMapped = 0;
+
+  for (const w of words) {
+    const idx = bundle.vocab[w];
+    if (idx !== undefined && idx < bundle.num_words) {
+      seq.push(idx);
+      tokensMapped += 1;
+    } else {
+      seq.push(2);
+    }
+  }
+
+  // Pad or truncate (pre-padding / pre-truncating to max_len = 200 like tf.keras.preprocessing.sequence.pad_sequences)
+  const maxLen = bundle.max_len || 200;
+  const padded = new Array(maxLen).fill(0);
+  const slice = seq.slice(-maxLen);
+  const offset = maxLen - slice.length;
+  for (let i = 0; i < slice.length; i++) {
+    padded[offset + i] = slice[i];
+  }
+
+  // Layer 0 + 1: Embedding(10000, 16) -> GlobalAveragePooling1D()
+  const embDim = bundle.embedding[0].length;
+  const pooled = new Array(embDim).fill(0);
+  for (let t = 0; t < maxLen; t++) {
+    const row = bundle.embedding[padded[t]];
+    for (let d = 0; d < embDim; d++) {
+      pooled[d] += row[d];
+    }
+  }
+  for (let d = 0; d < embDim; d++) {
+    pooled[d] /= maxLen;
+  }
+
+  // Layer 2: Dense(16, activation="relu")
+  const hiddenDim = bundle.dense1_b.length;
+  const hidden = new Array(hiddenDim).fill(0);
+  for (let j = 0; j < hiddenDim; j++) {
+    let sum = bundle.dense1_b[j];
+    for (let d = 0; d < embDim; d++) {
+      sum += pooled[d] * bundle.dense1_w[d][j];
+    }
+    hidden[j] = sum > 0 ? sum : 0;
+  }
+
+  // Layer 3: Dense(1, activation="sigmoid")
+  let logit = bundle.dense2_b;
+  for (let j = 0; j < hiddenDim; j++) {
+    logit += hidden[j] * bundle.dense2_w[j];
+  }
+  const score = 1 / (1 + Math.exp(-logit));
+  const label = score >= 0.5 ? "Positive" : "Negative";
+  const confidence = label === "Positive" ? score : 1 - score;
+  const latencyMs = Math.round((performance.now() - t0) * 10) / 10;
+
+  return {
+    label,
+    score: Number(score.toFixed(4)),
+    confidence: Number(confidence.toFixed(4)),
+    percent: Number((score * 100).toFixed(1)),
+    word_count: words.length,
+    tokens_mapped: tokensMapped,
+    latency_ms: latencyMs,
+    drivers: extractFallbackDrivers(rawText, label === "Positive"),
+  };
+}
 
 const POSITIVE_VOCAB = new Set([
   "excellent", "confident", "moving", "brilliant", "fantastic", "wonderful",
@@ -302,8 +401,10 @@ form.addEventListener("submit", async (event) => {
   submitButton.textContent = "Analyzing...";
 
   const startTime = performance.now();
+  const rawReview = textarea.value.trim();
   let response;
   let payload;
+  let useBrowserFallback = false;
 
   try {
     response = await fetch(`${API_BASE}/predict`, {
@@ -313,13 +414,54 @@ form.addEventListener("submit", async (event) => {
       },
       body: JSON.stringify({ review: textarea.value }),
     });
-  } catch (networkError) {
-    scorePanel.classList.remove("is-loading");
-    message.className = "message is-error";
-    message.textContent = "Could not reach Flask. Run python app.py and open http://127.0.0.1:5000.";
-    submitButton.disabled = false;
-    submitButton.textContent = "Analyze Review";
-    return;
+    if (response.status === 404 || response.status === 405) {
+      // Static hosting (e.g., GitHub Pages) returns 404/405 on POST /predict
+      useBrowserFallback = true;
+    }
+  } catch (_networkError) {
+    useBrowserFallback = true;
+  }
+
+  if (useBrowserFallback) {
+    if (!rawReview) {
+      scorePanel.classList.remove("is-loading");
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      message.className = "message is-error";
+      message.textContent = "Please enter a movie review.";
+      return;
+    }
+    if (rawReview.length > MAX_REVIEW_CHARS) {
+      scorePanel.classList.remove("is-loading");
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      message.className = "message is-error";
+      message.textContent = `Review must not exceed ${MAX_REVIEW_CHARS} characters.`;
+      return;
+    }
+    if (countWords(rawReview) < MIN_REVIEW_WORDS) {
+      scorePanel.classList.remove("is-loading");
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      message.className = "message is-error";
+      message.textContent = `Please enter at least ${MIN_REVIEW_WORDS} words.`;
+      return;
+    }
+    try {
+      const localResult = await classifyReviewInBrowser(rawReview);
+      scorePanel.classList.remove("is-loading");
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      setResult(localResult, performance.now() - startTime);
+      return;
+    } catch (_fallbackErr) {
+      scorePanel.classList.remove("is-loading");
+      message.className = "message is-error";
+      message.textContent = "Could not reach Flask. Run python app.py and open http://127.0.0.1:5000.";
+      submitButton.disabled = false;
+      submitButton.textContent = "Analyze Review";
+      return;
+    }
   }
 
   const elapsedMs = performance.now() - startTime;
